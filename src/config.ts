@@ -7,6 +7,7 @@ type RawConfig = Partial<{
   appPath: string;
   autoStartDaemon: boolean;
   startTimeoutMs: number;
+  agentCursorOverlay: boolean;
 }>;
 
 export interface MacosCuaConfig {
@@ -14,13 +15,15 @@ export interface MacosCuaConfig {
   appPath: string;
   autoStartDaemon: boolean;
   startTimeoutMs: number;
+  agentCursorOverlay: boolean;
 }
 
 const DEFAULTS = {
   appPath: "/Applications/CuaDriver.app",
   autoStartDaemon: true,
   startTimeoutMs: 10000,
-} satisfies Pick<MacosCuaConfig, "appPath" | "autoStartDaemon" | "startTimeoutMs">;
+  agentCursorOverlay: false,
+} satisfies Pick<MacosCuaConfig, "appPath" | "autoStartDaemon" | "startTimeoutMs" | "agentCursorOverlay">;
 
 async function readJsonIfPresent(path: string): Promise<RawConfig> {
   try {
@@ -68,6 +71,10 @@ export async function loadMacosCuaConfig(cwd: string): Promise<MacosCuaConfig> {
       parseNumber(process.env.PI_MACOS_CUA_START_TIMEOUT_MS, "PI_MACOS_CUA_START_TIMEOUT_MS") ??
       fileConfig.startTimeoutMs ??
       DEFAULTS.startTimeoutMs,
+    agentCursorOverlay:
+      parseBoolean(process.env.PI_MACOS_CUA_AGENT_CURSOR_OVERLAY) ??
+      fileConfig.agentCursorOverlay ??
+      DEFAULTS.agentCursorOverlay,
   };
 }
 
@@ -77,5 +84,6 @@ export function summarizeMacosCuaConfig(config: MacosCuaConfig): string {
     `app=${config.appPath}`,
     `autoStartDaemon=${config.autoStartDaemon}`,
     `startTimeoutMs=${config.startTimeoutMs}`,
+    `agentCursorOverlay=${config.agentCursorOverlay}`,
   ].join(" ");
 }

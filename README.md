@@ -95,6 +95,7 @@ export PI_MACOS_CUA_BINARY=/usr/local/bin/cua-driver
 export PI_MACOS_CUA_APP=/Applications/CuaDriver.app
 export PI_MACOS_CUA_AUTOSTART=1
 export PI_MACOS_CUA_START_TIMEOUT_MS=10000
+export PI_MACOS_CUA_AGENT_CURSOR_OVERLAY=0
 ```
 
 Optional config file:
@@ -107,11 +108,14 @@ Optional config file:
   "binaryPath": "/usr/local/bin/cua-driver",
   "appPath": "/Applications/CuaDriver.app",
   "autoStartDaemon": true,
-  "startTimeoutMs": 10000
+  "startTimeoutMs": 10000,
+  "agentCursorOverlay": false
 }
 ```
 
-This extension relies on `cua-driver call --raw`, so if the driver's raw JSON format changes in a future release, the wrapper may need an update too.
+The agent cursor overlay is disabled by default to avoid idle AppKit/WindowServer CPU usage. Set `agentCursorOverlay` or `PI_MACOS_CUA_AGENT_CURSOR_OVERLAY=1` if you want the visible agent cursor.
+
+This extension relies on `cua-driver call --raw`. It accepts both MCP-style raw results (`content` / `structuredContent`) and direct JSON results from newer driver builds; successful plain-text output is treated as a successful text result.
 
 ## Commands
 
@@ -137,33 +141,36 @@ The code runs inside a persistent Node REPL as the body of an async function, so
 - use `state.foo = ...` to persist values across calls
 - keep `state` plain structured-cloneable data only (objects, arrays, strings, numbers, booleans, null)
 
-Available helpers inside `macos_cua_exec`:
+Available helpers inside `macos_cua_exec` (all async except `unwrap`, `state`, `clearState`, and `console`):
 
-- `invoke(toolName, args)`
-- `checkPermissions(...)`
-- `listApps()`
-- `launchApp(...)`
-- `listWindows(...)`
-- `getWindowState(...)`
-- `click(...)`
-- `typeText(...)`
-- `setValue(...)`
-- `pressKey(...)`
-- `hotkey(...)`
-- `scroll(...)`
-- `sleep(ms)`
-- `state`
-- `clearState()`
-- `console.log(...)`
+- `invoke(toolName: string, args?: Record<string, unknown>) -> PiDriverToolResult` — raw wrapper for advanced use.
+- `unwrap(result: PiDriverToolResult) -> structuredContent | text | null`.
+- `checkPermissions(params?: { prompt?: boolean }) -> structured permission status/text`.
+- `listApps() -> { apps: AppInfo[] }`.
+- `launchApp(params: { bundle_id?: string; name?: string; urls?: string[] }) -> structured launch result/text`.
+- `listWindows(params?: { pid?: number; on_screen_only?: boolean }) -> { windows: WindowInfo[] }`.
+- `getWindowState(params: { pid: number; window_id: number; query?: string })` -> window snapshot with `tree_markdown`; screenshot base64 is omitted by default.
+- `click(params: { pid: number; window_id?: number; element_index?: number; x?: number; y?: number; action?: string; modifier?: string[]; count?: number; from_zoom?: boolean }) -> structured result/text`.
+- `typeText(params: { pid: number; text: string; element_index?: number; window_id?: number }) -> structured result/text`.
+- `setValue(params: { pid: number; window_id: number; element_index: number; value: string }) -> structured result/text`.
+- `pressKey(params: { pid: number; key: string; modifiers?: string[]; element_index?: number; window_id?: number }) -> structured result/text`.
+- `hotkey(params: { pid: number; keys: string[] }) -> structured result/text`, e.g. `await hotkey({ pid, keys: ["cmd", "shift", "a"] })`.
+- `scroll(params: { pid: number; direction: "up" | "down" | "left" | "right"; amount?: number; by?: "line" | "page"; element_index?: number; window_id?: number }) -> structured result/text`.
+- `sleep(ms: number) -> { ok: true; sleptMs: number }`.
+- `state` — persistent structured-cloneable object.
+- `clearState()`.
+- `console.log(...)` — captured in the tool output.
+
+Driver stdout/stderr are not stored verbatim in tool details. Details include bounded `stdoutPreview` / `stderrPreview` metadata instead, while parsed JSON is exposed as `structuredContent` and returned directly from the convenience helpers.
 
 Example:
 
 ```js
 const launched = await launchApp({ name: "Safari" });
 const windows = await listWindows();
-console.log("window count", windows.details.structuredContent?.windows?.length ?? 0);
-state.lastWindows = windows.details.structuredContent;
-return state.lastWindows;
+console.log("window count", windows.windows?.length ?? 0);
+state.lastWindows = windows;
+return { launched, windows: windows.windows?.slice(0, 3) };
 ```
 
 Because this executes arbitrary JavaScript in the extension process, keep sequences short

@@ -5,9 +5,27 @@ import { inspect } from "node:util";
 import { loadMacosCuaConfig, summarizeMacosCuaConfig } from "../src/config.js";
 import { ExecReplError, PersistentExecRepl } from "../src/exec-repl.js";
 import { MacosCuaDriver, type InvokeOptions, type PiDriverToolResult } from "../src/driver.js";
+import { truncateText } from "../src/truncate.js";
 
 const SEQUENTIAL: ToolExecutionMode = "sequential";
-const GET_WINDOW_STATE_OMIT_FIELDS = ["tree_markdown", "screenshot_png_b64", "screenshot_mime_type"];
+const GET_WINDOW_STATE_OMIT_FIELDS = ["screenshot_png_b64", "screenshot_mime_type"];
+const EXEC_HELPER_SIGNATURES = [
+  "invoke(toolName: string, args?: Record<string, unknown>) -> raw PiDriverToolResult",
+  "unwrap(result: PiDriverToolResult) -> structuredContent when present, otherwise text/null",
+  "checkPermissions(params?: { prompt?: boolean }) -> structured permission status/text",
+  "listApps() -> { apps: AppInfo[] }",
+  "launchApp(params: { bundle_id?: string; name?: string; urls?: string[] }) -> structured launch result/text",
+  "listWindows(params?: { pid?: number; on_screen_only?: boolean }) -> { windows: WindowInfo[] }",
+  "getWindowState(params: { pid: number; window_id: number; query?: string }) -> window snapshot with tree_markdown; screenshot base64 omitted",
+  "click(params: { pid: number; window_id?: number; element_index?: number; x?: number; y?: number; action?: string; modifier?: string[]; count?: number; from_zoom?: boolean }) -> structured result/text",
+  "typeText(params: { pid: number; text: string; element_index?: number; window_id?: number }) -> structured result/text",
+  "setValue(params: { pid: number; window_id: number; element_index: number; value: string }) -> structured result/text",
+  "pressKey(params: { pid: number; key: string; modifiers?: string[]; element_index?: number; window_id?: number }) -> structured result/text",
+  "hotkey(params: { pid: number; keys: string[] }) -> structured result/text (example: hotkey({ pid, keys: ['cmd', 'shift', 'a'] }))",
+  "scroll(params: { pid: number; direction: 'up' | 'down' | 'left' | 'right'; amount?: number; by?: 'line' | 'page'; element_index?: number; window_id?: number }) -> structured result/text",
+  "sleep(ms: number) -> { ok: true; sleptMs: number }",
+  "state: persistent structured-cloneable object; clearState(): void; console.log(...): captured log output",
+].join("\n- ");
 
 let piRef: ExtensionAPI;
 let macosCua: MacosCuaDriver;
@@ -93,19 +111,28 @@ function createExecHelpers(ctx: ExtensionContext, signal: AbortSignal | undefine
     return result;
   };
 
+  const call = async (
+    helper: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: InvokeOptions = {},
+  ): Promise<unknown> => unwrapDriverResult(await record(helper, toolName, args, options));
+
   return {
-    invoke: async (toolName: string, args: Record<string, unknown> = {}) => record(`invoke:${toolName}`, toolName, args),
+    invoke: async (toolName: string, args: Record<string, unknown> = {}) =>
+      record(`invoke:${toolName}`, toolName, args, defaultInvokeOptions(toolName)),
+    unwrap: unwrapDriverResult,
     checkPermissions: async (params: { prompt?: boolean } = {}) =>
-      record("checkPermissions", "check_permissions", { prompt: params.prompt ?? false }, { ensureDaemon: false }),
-    listApps: async () => record("listApps", "list_apps", {}, { ensureDaemon: false }),
+      call("checkPermissions", "check_permissions", { prompt: params.prompt ?? false }, { ensureDaemon: false }),
+    listApps: async () => call("listApps", "list_apps", {}, { ensureDaemon: false }),
     launchApp: async (params: { bundle_id?: string; name?: string; urls?: string[] }) => {
       assertLaunchTarget(params);
-      return record("launchApp", "launch_app", params, { ensureDaemon: true });
+      return call("launchApp", "launch_app", params, { ensureDaemon: true });
     },
     listWindows: async (params: { pid?: number; on_screen_only?: boolean } = {}) =>
-      record("listWindows", "list_windows", params, { ensureDaemon: true }),
+      call("listWindows", "list_windows", params, { ensureDaemon: true }),
     getWindowState: async (params: { pid: number; window_id: number; query?: string }) =>
-      record("getWindowState", "get_window_state", params, {
+      call("getWindowState", "get_window_state", params, {
         ensureDaemon: true,
         omitStructuredFields: GET_WINDOW_STATE_OMIT_FIELDS,
       }),
@@ -121,14 +148,14 @@ function createExecHelpers(ctx: ExtensionContext, signal: AbortSignal | undefine
       from_zoom?: boolean;
     }) => {
       assertClickTarget(params);
-      return record("click", "click", params, { ensureDaemon: true });
+      return call("click", "click", params, { ensureDaemon: true });
     },
     typeText: async (params: { pid: number; text: string; element_index?: number; window_id?: number }) => {
       assertElementWindowPair(params, "macos_cua_type_text");
-      return record("typeText", "type_text", params, { ensureDaemon: true });
+      return call("typeText", "type_text", params, { ensureDaemon: true });
     },
     setValue: async (params: { pid: number; window_id: number; element_index: number; value: string }) =>
-      record("setValue", "set_value", params, { ensureDaemon: true }),
+      call("setValue", "set_value", params, { ensureDaemon: true }),
     pressKey: async (params: {
       pid: number;
       key: string;
@@ -137,9 +164,9 @@ function createExecHelpers(ctx: ExtensionContext, signal: AbortSignal | undefine
       window_id?: number;
     }) => {
       assertElementWindowPair(params, "macos_cua_press_key");
-      return record("pressKey", "press_key", params, { ensureDaemon: true });
+      return call("pressKey", "press_key", params, { ensureDaemon: true });
     },
-    hotkey: async (params: { pid: number; keys: string[] }) => record("hotkey", "hotkey", params, { ensureDaemon: true }),
+    hotkey: async (params: { pid: number; keys: string[] }) => call("hotkey", "hotkey", params, { ensureDaemon: true }),
     scroll: async (params: {
       pid: number;
       direction: "up" | "down" | "left" | "right";
@@ -149,7 +176,7 @@ function createExecHelpers(ctx: ExtensionContext, signal: AbortSignal | undefine
       window_id?: number;
     }) => {
       assertElementWindowPair(params, "macos_cua_scroll");
-      return record("scroll", "scroll", params, { ensureDaemon: true });
+      return call("scroll", "scroll", params, { ensureDaemon: true });
     },
     sleep: async (ms: number) => {
       assertExecStillActive(signal);
@@ -158,6 +185,22 @@ function createExecHelpers(ctx: ExtensionContext, signal: AbortSignal | undefine
       return { ok: true, sleptMs: ms };
     },
   };
+}
+
+function defaultInvokeOptions(toolName: string): InvokeOptions {
+  return toolName === "get_window_state"
+    ? { ensureDaemon: true, omitStructuredFields: GET_WINDOW_STATE_OMIT_FIELDS }
+    : {};
+}
+
+function unwrapDriverResult(result: PiDriverToolResult): unknown {
+  const structuredContent = result.details.structuredContent;
+  if (structuredContent !== undefined && structuredContent !== null) {
+    return structuredContent;
+  }
+
+  const text = extractText(result);
+  return text || null;
 }
 
 function cloneForTrace(value: Record<string, unknown>): Record<string, unknown> {
@@ -259,7 +302,7 @@ function buildExecToolResult(
   }
 
   if (logs.length > 0) {
-    textSections.push(`Console output:\n${logs.join("\n")}`);
+    textSections.push(`Console output:\n${truncateText(logs.join("\n")).text}`);
   }
 
   const returnText = formatReturnedValue(returnedValue);
@@ -273,7 +316,7 @@ function buildExecToolResult(
 
   const content: PiDriverToolResult["content"] = [];
   if (textSections.length > 0) {
-    content.push({ type: "text", text: textSections.join("\n\n") });
+    content.push({ type: "text", text: truncateText(textSections.join("\n\n")).text });
   }
 
   for (const entry of trace) {
@@ -292,7 +335,7 @@ function buildExecToolResult(
     content,
     details: {
       driverTool: "exec",
-      logs,
+      logs: logs.map((line) => truncateText(line).text),
       returnValueText: returnText ?? null,
       stateKeys,
       steps: trace.map((entry) => ({
@@ -321,18 +364,19 @@ function summarizeExecError(error: unknown, trace: ExecTraceEntry[], logs: strin
   }
 
   if (logs.length > 0) {
-    parts.push(`Console output:\n${logs.join("\n")}`);
+    parts.push(`Console output:\n${truncateText(logs.join("\n")).text}`);
   }
 
-  return parts.join("\n\n");
+  return truncateText(parts.join("\n\n")).text;
 }
 
 function extractText(result: PiDriverToolResult): string {
-  return result.content
+  const text = result.content
     .filter((item): item is Extract<PiDriverToolResult["content"][number], { type: "text" }> => item.type === "text")
     .map((item) => item.text)
     .join("\n\n")
     .trim();
+  return truncateText(text).text;
 }
 
 function formatReturnedValue(value: unknown): string | null {
@@ -349,12 +393,14 @@ function formatReturnedValue(value: unknown): string | null {
 }
 
 function formatExecValue(value: unknown): string {
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return truncateText(value).text;
   try {
-    return JSON.stringify(value, null, 2);
+    const json = JSON.stringify(value, null, 2);
+    if (typeof json === "string") return truncateText(json).text;
   } catch {
-    return inspect(value, { depth: 5, colors: false, breakLength: 100 });
+    // Fall through to inspect for non-JSON-serializable values.
   }
+  return truncateText(inspect(value, { depth: 5, colors: false, breakLength: 100 })).text;
 }
 
 function isPiDriverToolResult(value: unknown): value is PiDriverToolResult {
@@ -394,7 +440,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => ({
     systemPrompt:
       event.systemPrompt
-      + "\n\nWhen doing local macOS computer use: if CuaDriver.app is missing, ask the user to run /install-cua-driver first. Use the macos_cua_exec tool for all macOS CUA actions. Inside macos_cua_exec, use helpers like launchApp(), listWindows(), getWindowState(), click(), typeText(), setValue(), pressKey(), hotkey(), scroll(), and checkPermissions(). Prefer launchApp() instead of `open -a` or `osascript activate`; call getWindowState() before element-indexed GUI actions; prefer element_index interactions over raw pixel clicks when the AX tree exposes the target; after UI-changing actions, re-snapshot with getWindowState() before taking the next action. Persist cross-call values in state.* when needed.",
+      + `\n\nWhen doing local macOS computer use: if CuaDriver.app is missing, ask the user to run /install-cua-driver first. Use the macos_cua_exec tool for all macOS CUA actions. Helpers other than invoke() return unwrapped structured data when available; invoke() returns the raw PiDriverToolResult and can be passed to unwrap(). Prefer launchApp() instead of \`open -a\` or \`osascript activate\`; call getWindowState() before element-indexed GUI actions; prefer element_index interactions over raw pixel clicks when the AX tree exposes the target; after UI-changing actions, re-snapshot with getWindowState() before taking the next action. Persist cross-call values in state.* when needed.\n\nmacos_cua_exec helper signatures:\n- ${EXEC_HELPER_SIGNATURES}`,
   }));
 
   pi.registerCommand("install-cua-driver", {
@@ -472,13 +518,15 @@ export default function (pi: ExtensionAPI) {
     name: "macos_cua_exec",
     label: "Exec",
     description:
-      "Execute a short JavaScript snippet inside a persistent Node REPL with helper functions like launchApp(), getWindowState(), click(), and typeText(). Use state.* to persist values across calls.",
+      "Execute a short JavaScript snippet inside a persistent Node REPL with helpers like launchApp(), getWindowState(), click(), and typeText(). Helpers return structured data/text directly; invoke() returns a raw result for advanced use. Use state.* to persist values across calls.",
     promptSnippet: "Run a short deterministic JavaScript sequence that chains macOS CUA helper calls",
     promptGuidelines: [
       "Use macos_cua_exec for all macOS CUA actions in this extension.",
       "The code runs as the body of an async function, so use await and return your final value explicitly.",
-      "Available helpers: invoke, checkPermissions, listApps, launchApp, listWindows, getWindowState, click, typeText, setValue, pressKey, hotkey, scroll, sleep, state, clearState, console.",
+      "Helpers other than invoke() return unwrapped structured data when available, otherwise text/null. invoke() returns a raw PiDriverToolResult; use unwrap(await invoke(...)) for the structured/text payload.",
+      `Helper signatures:\n- ${EXEC_HELPER_SIGNATURES}`,
       "If your code uses element_index, call getWindowState() first and usually again after UI-changing actions.",
+      "Call hotkey({ pid, keys: ['cmd', 'shift', 'a'] }) with one object argument; do not pass positional key strings.",
     ],
     parameters: Type.Object({
       code: Type.String({

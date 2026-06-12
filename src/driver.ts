@@ -3,6 +3,11 @@ import { access } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 
 import type { MacosCuaConfig } from "./config.js";
+import {
+  DETAILS_PREVIEW_MAX_BYTES,
+  DETAILS_PREVIEW_MAX_LINES,
+  truncateText,
+} from "./truncate.js";
 
 const INSTALL_COMMAND_HINT = "Run /install-cua-driver for the install command.";
 
@@ -28,6 +33,10 @@ type DriverRawResult = {
   content?: DriverRawContent[];
   structuredContent?: unknown;
   isError?: boolean;
+};
+
+type NormalizedDriverRawResult = DriverRawResult & {
+  rawKind: "mcp" | "json" | "text" | "empty";
 };
 
 type PiTextBlock = { type: "text"; text: string };
@@ -123,35 +132,36 @@ export class MacosCuaDriver {
       { timeout: options.timeoutMs ?? 30000, signal },
     );
 
-    const parsed = this.tryParseRaw(execResult.stdout);
-    if (!parsed) {
-      throw new Error(
-        [
-          `Expected machine-readable JSON from \`cua-driver call --raw\` for ${toolName}, but parsing failed.`,
-          execResult.stderr.trim(),
-          execResult.stdout.trim(),
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
-      );
-    }
-
-    const content = this.buildPiContent(parsed, options.omitStructuredFields ?? []);
+    const parsed = this.normalizeRawResult(execResult.stdout);
+    const omitStructuredFields = options.omitStructuredFields ?? [];
+    const content = this.buildPiContent(parsed, omitStructuredFields);
     if (parsed.isError || execResult.code !== 0) {
-      const message = this.contentToText(content)
+      const contentText = this.contentToText(content);
+      const message = (contentText && contentText !== "cua-driver returned no content." ? contentText : "")
         || execResult.stderr.trim()
+        || execResult.stdout.trim()
         || `${toolName} failed.`;
       throw new Error(message);
     }
+
+    const stdoutPreview = buildPreview(execResult.stdout);
+    const stderrPreview = buildPreview(execResult.stderr);
 
     return {
       content,
       details: {
         driverTool: toolName,
         binaryPath,
-        structuredContent: parsed.structuredContent ?? null,
-        stdout: execResult.stdout,
-        stderr: execResult.stderr,
+        rawKind: parsed.rawKind,
+        structuredContent: sanitizeStructuredContent(parsed.structuredContent, omitStructuredFields) ?? null,
+        stdoutPreview: stdoutPreview.text,
+        stdoutBytes: stdoutPreview.totalBytes,
+        stdoutLines: stdoutPreview.totalLines,
+        stdoutTruncated: stdoutPreview.truncated,
+        stderrPreview: stderrPreview.text,
+        stderrBytes: stderrPreview.totalBytes,
+        stderrLines: stderrPreview.totalLines,
+        stderrTruncated: stderrPreview.truncated,
         exitCode: execResult.code,
       },
     };
@@ -176,7 +186,7 @@ export class MacosCuaDriver {
 
     if (!config.autoStartDaemon) {
       throw new Error(
-        "cua-driver daemon is not running. Start it with `open -n -g -a CuaDriver --args serve` or enable autoStartDaemon.",
+        `cua-driver daemon is not running. Start it with \`${this.formatManualStartCommand(config)}\` or enable autoStartDaemon.`,
       );
     }
 
@@ -185,9 +195,10 @@ export class MacosCuaDriver {
       throw new Error(this.getInstallRequiredMessage(config));
     }
 
+    const serveArgs = ["serve", ...(config.agentCursorOverlay ? [] : ["--no-overlay"])] as string[];
     const openResult = await this.exec(
       "/usr/bin/open",
-      ["-n", "-g", config.appPath, "--args", "serve"],
+      ["-n", "-g", config.appPath, "--args", ...serveArgs],
       { timeout: 3000, signal },
     );
     if (openResult.code !== 0) {
@@ -204,6 +215,11 @@ export class MacosCuaDriver {
     throw new Error(
       "Timed out waiting for cua-driver daemon. Run `cua-driver check_permissions` or `cua-driver diagnose` and make sure CuaDriver.app has Accessibility + Screen Recording access.",
     );
+  }
+
+  private formatManualStartCommand(config: MacosCuaConfig): string {
+    const overlayArg = config.agentCursorOverlay ? "" : " --no-overlay";
+    return `open -n -g ${JSON.stringify(config.appPath)} --args serve${overlayArg}`;
   }
 
   private async requireBinary(config: MacosCuaConfig): Promise<string> {
@@ -231,32 +247,52 @@ export class MacosCuaDriver {
     return null;
   }
 
-  private tryParseRaw(stdout: string): DriverRawResult | null {
+  private normalizeRawResult(stdout: string): NormalizedDriverRawResult {
     const trimmed = stdout.trim();
-    if (!trimmed.startsWith("{")) return null;
+    if (!trimmed) return { rawKind: "empty", content: [] };
+
     try {
-      return JSON.parse(trimmed) as DriverRawResult;
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (isDriverRawResult(parsed)) {
+        return { ...parsed, rawKind: "mcp" };
+      }
+      return { rawKind: "json", content: [], structuredContent: parsed };
     } catch {
-      return null;
+      return {
+        rawKind: "text",
+        content: [{ type: "text", text: trimmed }],
+      };
     }
   }
 
-  private buildPiContent(parsed: DriverRawResult, omitStructuredFields: string[]): Array<PiTextBlock | PiImageBlock> {
+  private buildPiContent(parsed: NormalizedDriverRawResult, omitStructuredFields: string[]): Array<PiTextBlock | PiImageBlock> {
     const textParts = (parsed.content ?? [])
-      .flatMap((item) => (item.type === "text" && typeof item.text === "string" ? [item.text.trim()] : []))
+      .flatMap((item) => (item.type === "text" && typeof item.text === "string" ? [truncateText(item.text.trim()).text] : []))
       .filter(Boolean);
 
-    const sanitizedStructured = sanitizeStructuredContent(parsed.structuredContent, omitStructuredFields);
+    const omitSet = new Set(omitStructuredFields);
+    const structured = parsed.structuredContent;
+    const treeMarkdown = isRecord(structured) && typeof structured.tree_markdown === "string"
+      ? structured.tree_markdown
+      : undefined;
+    if (treeMarkdown && !omitSet.has("tree_markdown")) {
+      textParts.push(`UI tree:\n${truncateText(treeMarkdown).text}`);
+    }
+
+    const sanitizedStructured = sanitizeStructuredContent(
+      structured,
+      uniqueStrings([...omitStructuredFields, "screenshot_png_b64", "tree_markdown"]),
+    );
     if (sanitizedStructured !== undefined) {
-      const structuredText = JSON.stringify(sanitizedStructured, null, 2);
+      const structuredText = safeStringify(sanitizedStructured);
       if (structuredText && structuredText !== "{}") {
-        textParts.push(`Structured data:\n${structuredText}`);
+        textParts.push(`Structured data:\n${truncateText(structuredText).text}`);
       }
     }
 
     const content: Array<PiTextBlock | PiImageBlock> = [];
     if (textParts.length > 0) {
-      content.push({ type: "text", text: textParts.join("\n\n") });
+      content.push({ type: "text", text: truncateText(textParts.join("\n\n")).text });
     }
 
     for (const item of parsed.content ?? []) {
@@ -270,12 +306,12 @@ export class MacosCuaDriver {
       content.push({ type: "image", data: item.data, mimeType });
     }
 
-    if (!content.some((item) => item.type === "image")) {
-      const structured = isRecord(parsed.structuredContent) ? parsed.structuredContent : undefined;
-      const base64 = typeof structured?.screenshot_png_b64 === "string" ? structured.screenshot_png_b64 : undefined;
-      if (base64 && structured) {
-        const mimeType = typeof structured.screenshot_mime_type === "string"
-          ? structured.screenshot_mime_type
+    if (!content.some((item) => item.type === "image") && !omitSet.has("screenshot_png_b64")) {
+      const structuredRecord = isRecord(parsed.structuredContent) ? parsed.structuredContent : undefined;
+      const base64 = typeof structuredRecord?.screenshot_png_b64 === "string" ? structuredRecord.screenshot_png_b64 : undefined;
+      if (base64 && structuredRecord) {
+        const mimeType = typeof structuredRecord.screenshot_mime_type === "string"
+          ? structuredRecord.screenshot_mime_type
           : "image/png";
         content.push({ type: "image", data: base64, mimeType });
       }
@@ -296,6 +332,20 @@ export class MacosCuaDriver {
   }
 }
 
+function isDriverRawResult(value: unknown): value is DriverRawResult {
+  if (!isRecord(value)) return false;
+  if ("structuredContent" in value || typeof value.isError === "boolean") return true;
+  if (!Array.isArray(value.content)) return false;
+  return value.content.every((item) => isRecord(item) && typeof item.type === "string");
+}
+
+function buildPreview(value: string) {
+  return truncateText(value, {
+    maxBytes: DETAILS_PREVIEW_MAX_BYTES,
+    maxLines: DETAILS_PREVIEW_MAX_LINES,
+  });
+}
+
 function sanitizeStructuredContent(value: unknown, omitFields: string[]): unknown {
   if (!isRecord(value)) return value;
   const copy: Record<string, unknown> = { ...value };
@@ -303,6 +353,18 @@ function sanitizeStructuredContent(value: unknown, omitFields: string[]): unknow
     delete copy[field];
   }
   return copy;
+}
+
+function safeStringify(value: unknown): string | null {
+  try {
+    return JSON.stringify(value, null, 2) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
